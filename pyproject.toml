@@ -1,0 +1,13 @@
+[project]
+name = "comfyui-h3videoremake"
+description = "Multi-clip MiniMax H3 videos: Media Input (upload up to 9 reference images and 3 reference audios, group them into subjects, optional LLM descriptions), Image/Audio Aggregators for MiniMaxH3ReferenceToVideo, and a Prompt editor for the six H3 sections."
+version = "0.1.0"
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = ["comfyui", "minimax-h3", "video-generation", "audio"]
+
+[tool.comfy]
+DisplayName = "H3 Video Remake"
+
+[project.urls]
+Repository = "https://github.com/shisa84/ComfyUI-H3VideoRemake"

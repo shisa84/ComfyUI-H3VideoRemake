@@ -1,4 +1,6 @@
-// Prompt editor for "H3 Remake · Prompt", modelled on Easy-Media's segment prompt editor:
+// Prompt editor for "H3 Remake · Prompt", modelled on Easy-Media's task segments and segment editor:
+// general params (phase/resolutions/project folder/validation mode) on top, then a row of clips
+// (each with its duration, valid flag and its own prompt); choosing one opens its editor with
 // the six H3 sections as one text, A/B versions (the selected one is output), and clickable
 // reference chips (<Picture N>, <Subject N>, <Audio N>) read from the Media Input wired to `data`,
 // with those tags and the section headers highlighted. After a run, sections left empty are
@@ -21,6 +23,28 @@ const CSS = `
 .h3p-seg button{border:0;background:none;color:#999;font-size:11px;padding:3px 10px;border-radius:4px;cursor:pointer}
 .h3p-seg button.on{background:#333;color:#6ab0ff}
 .h3p-title{color:#aaa;font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+.h3p-general{display:flex;flex-wrap:wrap;gap:8px;align-items:center;flex:0 0 auto;font-size:11px;color:#999}
+.h3p-general input[type=number]{width:52px;background:#222;color:#ddd;border:1px solid #555;border-radius:4px;padding:2px 4px;font-size:11px}
+.h3p-general input[type=text]{flex:1;min-width:90px;background:#222;color:#ddd;border:1px solid #555;border-radius:4px;padding:2px 4px;font-size:11px}
+.h3p-general select{background:#222;color:#ddd;border:1px solid #555;border-radius:4px;padding:2px 4px;font-size:11px}
+.h3p-general .sep{color:#555}
+.h3p-clips{display:flex;flex-wrap:wrap;gap:4px;flex:0 0 auto;max-height:70px;overflow-y:auto}
+.h3p-clip{border:1px solid #444;border-left:4px solid #8a5cd0;border-radius:5px;background:#222;color:#ccc;font-size:11px;
+  padding:4px 8px;cursor:pointer;white-space:nowrap}
+.h3p-clip:hover{border-color:#888;border-left-color:#8a5cd0}
+.h3p-clip.on{background:#3a2d52;color:#fff;border-color:#8a5cd0}
+.h3p-clip.valid{border-left-color:#5fb878}
+.h3p-add{border:1px dashed #666;border-radius:5px;background:none;color:#999;font-size:11px;padding:4px 8px;cursor:pointer}
+.h3p-add:hover{border-color:#aaa;color:#ddd}
+.h3p-clipbar{display:flex;flex-wrap:wrap;align-items:center;gap:6px;flex:0 0 auto;border-top:1px dashed #444;padding-top:6px}
+.h3p-valid{display:flex;align-items:center;gap:4px;color:#999;cursor:pointer}
+.h3p-clipbar .name{font-weight:600;color:#c9a8f5}
+.h3p-clipbar input{width:60px;background:#222;color:#ddd;border:1px solid #555;border-radius:4px;padding:2px 4px;font-size:11px}
+.h3p-icon{border:1px solid #444;border-radius:4px;background:#222;color:#ccc;font-size:11px;padding:2px 6px;cursor:pointer}
+.h3p-icon:hover:not(:disabled){border-color:#888}
+.h3p-icon:disabled{opacity:.35;cursor:default}
+.h3p-icon.danger{color:#f08080}
+.h3p-empty{flex:1;display:flex;align-items:center;justify-content:center;color:#888;font-size:12px;border:1px dashed #444;border-radius:6px}
 .h3p-fill{border:1px solid #444;border-radius:5px;background:#222;color:#ccc;font-size:11px;padding:3px 8px;cursor:pointer}
 .h3p-fill:hover:not(:disabled){border-color:#888}
 .h3p-fill:disabled{opacity:.4;cursor:default}
@@ -98,15 +122,44 @@ function splitSections(text) {
   return Object.fromEntries(SECTIONS.map((name) => [name, (sections[name] ?? []).join("\n").trim()]));
 }
 
+const uid = () => Math.random().toString(36).slice(2, 10);
+const DEFAULT_DURATION = 5; // seconds, about H3's 124-frame default
+const newClip = (user) => ({ id: uid(), duration: DEFAULT_DURATION, variant: "a", user_a: user, user_b: "", valid: false });
+const defaultGeneral = () => ({ aspect_ratio: "16:9 (Widescreen)", megapixels: 1.0, two_phase: false, upscale_megapixels: 4.0,
+  project_folder: "", validation: "manual" });
+
+// Same presets and formula as the core Resolution Selector node (comfy_extras/nodes_resolution.py).
+const ASPECT_RATIOS = { "1:1 (Square)": [1, 1], "2:3 (Portrait Photo)": [2, 3], "3:2 (Photo)": [3, 2],
+  "3:4 (Portrait Standard)": [3, 4], "4:3 (Standard)": [4, 3], "9:16 (Portrait Widescreen)": [9, 16],
+  "16:9 (Widescreen)": [16, 9], "21:9 (Ultrawide)": [21, 9] };
+const RESOLUTION_MULTIPLE = 32; // MiniMax H3's per-axis rounding (comfy_extras/nodes_minimax_h3.py)
+function computeResolution(aspectRatio, megapixels) {
+  const [wRatio, hRatio] = ASPECT_RATIOS[aspectRatio] ?? ASPECT_RATIOS["16:9 (Widescreen)"];
+  const scale = Math.sqrt((megapixels * 1024 * 1024) / (wRatio * hRatio));
+  const width = Math.round((wRatio * scale) / RESOLUTION_MULTIPLE) * RESOLUTION_MULTIPLE;
+  const height = Math.round((hRatio * scale) / RESOLUTION_MULTIPLE) * RESOLUTION_MULTIPLE;
+  return [width, height];
+}
+
+function segment(items, active, pick) {
+  return el("div", { class: "h3p-seg" },
+    items.map(([key, label]) => el("button", { class: key === active ? "on" : "", onclick: () => pick(key) }, label)));
+}
+
 const joinSections = (sections) => SECTIONS.map((name) => `${name}:\n${sections[name]}`.trimEnd()).join("\n\n") + "\n";
 
-// The Media Input node feeding `data`, if any: its picker state gives the chips, its last run the data.
-function sourceMedia(node) {
-  const input = node.inputs?.find((i) => i.name === "data");
+// The node feeding one of this node's inputs, if connected.
+function linkOrigin(node, inputName) {
+  const input = node.inputs?.find((i) => i.name === inputName);
   const graph = node.graph ?? app.graph;
   if (input?.link == null || !graph) return null;
   const link = graph.getLink?.(input.link) ?? graph.links?.get?.(input.link) ?? graph.links?.[input.link];
-  const origin = link ? graph.getNodeById(link.origin_id) : null;
+  return link ? graph.getNodeById(link.origin_id) : null;
+}
+
+// The Media Input node feeding `data`, if any: its picker state gives the chips, its last run the data.
+function sourceMedia(node) {
+  const origin = linkOrigin(node, "data");
   return origin?.type === MEDIA_NODE ? origin : null;
 }
 
@@ -114,7 +167,8 @@ class PromptEditor {
   constructor(node, defaults) {
     this.node = node;
     this.defaults = defaults;
-    this.state = { variant: "a", user_a: defaults.user, user_b: "" };
+    this.state = { clips: [newClip(defaults.user)], selected: null, general: defaultGeneral() };
+    this.latentIds = new Set(); // clip ids that actually have a saved latent on disk, from the last run
     this.root = el("div", { class: "h3p" });
     // Keep typing and scrolling inside the editor instead of the canvas.
     this.root.addEventListener("keydown", (e) => e.stopPropagation());
@@ -124,50 +178,173 @@ class PromptEditor {
     window.addEventListener("h3remake:media-changed", this.onMediaChanged);
     this.onData = (e) => { if (e.detail === sourceMedia(this.node)) this.receiveData(e.detail.h3remakeData); };
     window.addEventListener("h3remake:data", this.onData);
+    // A connected Save Clip Latent runs after Prompt in the same queue, so Prompt can't see the save by
+    // re-executing itself; it tells us directly instead (see h3remake_clip_latent.js).
+    this.onLatentSaved = (e) => { if (linkOrigin(e.detail.node, "clip_index") === this.node) this.markClipIndexSaved(e.detail.clip_index); };
+    window.addEventListener("h3remake:latent-saved", this.onLatentSaved);
     this.render();
   }
 
   get value() { return JSON.stringify(this.state); }
 
   load(value) {
-    try {
-      const data = typeof value === "string" ? JSON.parse(value || "{}") : value || {};
-      this.state = {
-        variant: data.variant === "b" ? "b" : "a",
-        user_a: typeof data.user_a === "string" ? data.user_a : this.defaults.user,
-        user_b: typeof data.user_b === "string" ? data.user_b : "",
-      };
-    } catch {
-      this.state = { variant: "a", user_a: this.defaults.user, user_b: "" };
-    }
+    let data = {};
+    try { data = typeof value === "string" ? JSON.parse(value || "{}") : value || {}; } catch { /* keep defaults */ }
+    // A prompt saved before clips existed becomes the first clip.
+    const clips = Array.isArray(data.clips) ? data.clips : "user_a" in data ? [{ ...newClip(""), ...data }] : [newClip(this.defaults.user)];
+    this.state = {
+      clips: clips.map((clip) => ({ ...newClip(this.defaults.user), ...clip, variant: clip.variant === "b" ? "b" : "a" })),
+      selected: clips.some((clip) => clip.id === data.selected) ? data.selected : null,
+      general: { ...defaultGeneral(), ...(data.general || {}) },
+    };
     this.render();
   }
 
-  get textKey() { return this.state.variant === "b" ? "user_b" : "user_a"; }
+  get clip() { return this.state.clips.find((clip) => clip.id === this.state.selected) ?? null; }
+  get clipIndex() { return this.state.clips.findIndex((clip) => clip.id === this.state.selected); }
+  get textKey() { return this.clip?.variant === "b" ? "user_b" : "user_a"; }
 
   setText(text) {
-    this.state[this.textKey] = text;
-    this.node.setDirtyCanvas?.(true, true);
+    this.clip[this.textKey] = text;
+    this.changed();
+  }
+
+  changed() { this.node.setDirtyCanvas?.(true, true); }
+
+  // ---------- clips ----------
+  selectClip(id) {
+    this.state.selected = id;
+    this.changed();
+    this.render();
+  }
+
+  addClip(copyOf = null) {
+    const clip = copyOf ? { ...copyOf, id: uid(), valid: false } : newClip(this.defaults.user);
+    const at = copyOf ? this.clipIndex + 1 : this.state.clips.length;
+    this.state.clips.splice(at, 0, clip);
+    if (!copyOf && this.data) this.fillClip(clip, false);
+    this.selectClip(clip.id);
+  }
+
+  moveClip(step) {
+    const clips = this.state.clips, from = this.clipIndex, to = from + step;
+    if (to < 0 || to >= clips.length) return;
+    clips.splice(to, 0, clips.splice(from, 1)[0]);
+    this.changed();
+    this.render();
+  }
+
+  removeClip() {
+    const at = this.clipIndex;
+    this.state.clips.splice(at, 1);
+    this.state.selected = this.state.clips[Math.min(at, this.state.clips.length - 1)]?.id ?? null;
+    this.changed();
+    this.render();
+  }
+
+  renderClips() {
+    const blocks = this.state.clips.map((clip, i) => el("button", { class: `h3p-clip${clip.id === this.state.selected ? " on" : ""}${clip.valid ? " valid" : ""}`,
+      title: "Edit this clip", onclick: () => this.selectClip(clip.id) }, `${clip.valid ? "✓ " : ""}Clip ${i + 1} · ${Number(clip.duration).toFixed(1)}s`));
+    blocks.push(el("button", { class: "h3p-add", onclick: () => this.addClip() }, "+ Add clip"));
+    return el("div", { class: "h3p-clips" }, blocks);
+  }
+
+  renderGeneral() {
+    const g = this.state.general;
+    const aspectSelect = el("select", { title: "Aspect ratio (same presets as the core Resolution Selector node)" },
+      Object.keys(ASPECT_RATIOS).map((key) => el("option", { value: key, selected: g.aspect_ratio === key }, key)));
+    aspectSelect.addEventListener("change", () => { g.aspect_ratio = aspectSelect.value; this.changed(); this.render(); });
+    const mp = (key, title) => {
+      const input = el("input", { type: "number", min: "0.1", max: "16", step: "0.1", value: g[key], title });
+      input.addEventListener("change", () => {
+        const value = Number(input.value);
+        if (Number.isFinite(value) && value > 0) g[key] = value;
+        this.changed();
+        this.render();
+      });
+      return input;
+    };
+    const readout = (megapixels) => {
+      const [w, h] = computeResolution(g.aspect_ratio, megapixels);
+      return el("span", { class: "h3p-hint" }, `${w}×${h}`);
+    };
+    const phase = segment([["1", "1 phase"], ["2", "2 phase"]], g.two_phase ? "2" : "1", (key) => {
+      g.two_phase = key === "2";
+      this.changed();
+      this.render();
+    });
+    const validation = segment([["manual", "Manual"], ["auto", "Auto"]], g.validation, (key) => {
+      g.validation = key;
+      this.changed();
+    });
+    const folder = el("input", { type: "text", placeholder: "project folder (under output/)", value: g.project_folder,
+      title: "Where each clip's latent is saved/loaded (project_folder/clip_N.latent, under ComfyUI's output folder)." });
+    folder.addEventListener("change", () => { g.project_folder = folder.value.trim(); this.changed(); });
+    return el("div", { style: "display:flex;flex-direction:column;gap:4px;flex:0 0 auto" }, [
+      el("div", { class: "h3p-general" }, [
+        phase, el("span", { class: "sep" }, "|"),
+        aspectSelect, mp("megapixels", "Base megapixels"), el("span", { class: "h3p-hint" }, "MP"), readout(g.megapixels),
+        ...(g.two_phase ? [el("span", { class: "sep" }, "→"),
+          mp("upscale_megapixels", "Upscale megapixels"), el("span", { class: "h3p-hint" }, "MP"), readout(g.upscale_megapixels)] : []),
+      ]),
+      el("div", { class: "h3p-general" }, [folder, validation]),
+    ]);
+  }
+
+  renderClipBar() {
+    const clip = this.clip, at = this.clipIndex, count = this.state.clips.length;
+    const duration = el("input", { type: "number", min: "0.5", max: "60", step: "0.1", value: clip.duration, title: "Clip duration in seconds (24 fps)" });
+    duration.addEventListener("change", () => {
+      const seconds = Number(duration.value);
+      clip.duration = Number.isFinite(seconds) && seconds > 0 ? seconds : DEFAULT_DURATION;
+      this.changed();
+      this.render();
+    });
+    const hasLatent = this.latentIds.has(clip.id);
+    const valid = el("input", { type: "checkbox", checked: clip.valid, disabled: !hasLatent,
+      title: hasLatent ? "This clip's latent is trusted for the next clip's continuity (Manual validation mode)."
+        : "Run the workflow with latent connected for this clip first (no saved latent for it yet)." });
+    valid.addEventListener("change", () => { clip.valid = valid.checked; this.changed(); this.render(); });
+    return el("div", { class: "h3p-clipbar" }, [
+      el("span", { class: "name" }, `Clip ${at + 1}`),
+      duration, el("span", { class: "h3p-hint" }, "s"),
+      el("label", { class: "h3p-valid" }, [valid, "Valid"]),
+      el("span", { style: "flex:1" }),
+      el("button", { class: "h3p-icon", title: "Move left", disabled: at === 0, onclick: () => this.moveClip(-1) }, "◀"),
+      el("button", { class: "h3p-icon", title: "Move right", disabled: at === count - 1, onclick: () => this.moveClip(1) }, "▶"),
+      el("button", { class: "h3p-icon", title: "Duplicate this clip", onclick: () => this.addClip(clip) }, "Duplicate"),
+      el("button", { class: "h3p-icon danger", title: "Delete this clip", onclick: () => this.removeClip() }, "Delete"),
+    ]);
   }
 
   render() {
-    const segment = (items, active, pick) => el("div", { class: "h3p-seg" },
-      items.map(([key, label]) => el("button", { class: key === active ? "on" : "", onclick: () => pick(key) }, label)));
-    const variants = segment([["a", "A"], ["b", "B"]], this.state.variant, (variant) => {
+    const header = el("div", { class: "h3p-bar" }, [el("span", { class: "h3p-title" }, `Clips ${this.state.clips.length}`)]);
+    const clip = this.clip;
+    if (!clip) {
+      this.chips = null;
+      this.root.replaceChildren(header, this.renderGeneral(), this.renderClips(),
+        el("div", { class: "h3p-empty" }, this.state.clips.length ? "Choose a clip to write its prompt." : "Add a clip to start."));
+      return;
+    }
+    const variants = segment([["a", "A"], ["b", "B"]], clip.variant, (variant) => {
       // A fresh B starts as a copy of A, to be edited or compared.
-      if (variant === "b" && !this.state.user_b) this.state.user_b = this.state.user_a;
-      this.state.variant = variant;
-      this.node.setDirtyCanvas?.(true, true);
+      if (variant === "b" && !clip.user_b) clip.user_b = clip.user_a;
+      clip.variant = variant;
+      this.changed();
       this.render();
     });
     this.chips = el("div", { class: "h3p-chips" });
     this.back = el("div", { class: "back" });
     this.area = el("textarea", { spellcheck: "false" });
-    this.area.value = this.state[this.textKey];
+    this.area.value = clip[this.textKey];
     this.back.innerHTML = highlight(this.area.value);
     this.area.addEventListener("input", () => { this.setText(this.area.value); this.back.innerHTML = highlight(this.area.value); this.syncScroll(); });
     this.area.addEventListener("scroll", () => this.syncScroll());
     this.root.replaceChildren(
+      header,
+      this.renderGeneral(),
+      this.renderClips(),
+      this.renderClipBar(),
       el("div", { class: "h3p-bar" }, [
         el("span", { class: "h3p-title" }, "Prompt"),
         el("div", { style: "display:flex;gap:6px;align-items:center" }, [
@@ -184,12 +361,12 @@ class PromptEditor {
 
   syncScroll() { this.back.scrollTop = this.area.scrollTop; }
 
-  // Copy data's sections into the text: into empty sections only (after a run), or over every section
-  // data has content for ("Fill from data").
-  fill(overwrite) {
-    const keys = overwrite ? [this.textKey] : ["user_a", "user_b"].filter((key) => this.state[key]);
+  // Copy data's sections into a clip's text: into its empty sections only (A and B), or over every section
+  // data has content for in the version shown ("Fill from data").
+  fillClip(clip, overwrite) {
+    const keys = overwrite ? [clip.variant === "b" ? "user_b" : "user_a"] : ["user_a", "user_b"].filter((key) => clip[key]);
     for (const key of keys) {
-      const sections = splitSections(this.state[key]);
+      const sections = splitSections(clip[key]);
       let changed = false;
       for (const name of SECTIONS) {
         if (this.data[name] && (overwrite || !sections[name]) && sections[name] !== this.data[name]) {
@@ -197,15 +374,34 @@ class PromptEditor {
           changed = true;
         }
       }
-      if (changed) this.state[key] = joinSections(sections);
+      if (changed) clip[key] = joinSections(sections);
     }
-    this.node.setDirtyCanvas?.(true, true);
+  }
+
+  fill(overwrite) {
+    this.fillClip(this.clip, overwrite);
+    this.changed();
     this.render();
   }
 
   receiveData(data) {
     this.data = data;
-    this.fill(false);
+    for (const clip of this.state.clips) this.fillClip(clip, false);
+    this.changed();
+    this.render();
+  }
+
+  receiveLatentIds(ids) {
+    this.latentIds = new Set(ids);
+    this.render();
+  }
+
+  markClipIndexSaved(clipIndex) {
+    const clip = this.state.clips[clipIndex - 1];
+    if (clip && !this.latentIds.has(clip.id)) {
+      this.latentIds.add(clip.id);
+      this.render();
+    }
   }
 
   renderChips() {
@@ -245,6 +441,7 @@ class PromptEditor {
   destroy() {
     window.removeEventListener("h3remake:media-changed", this.onMediaChanged);
     window.removeEventListener("h3remake:data", this.onData);
+    window.removeEventListener("h3remake:latent-saved", this.onLatentSaved);
   }
 }
 
@@ -256,12 +453,20 @@ app.registerExtension({
     const onNodeCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
       onNodeCreated?.apply(this, arguments);
-      this.setSize([520, 520]);
+      this.setSize([540, 660]);
+    };
+    // A narrower resize (e.g. grabbing the corner instead of the header while trying to move the node)
+    // used to hide the clip bar's buttons entirely; keep a floor wide enough for them.
+    const onResize = nodeType.prototype.onResize;
+    nodeType.prototype.onResize = function (size) {
+      onResize?.apply(this, arguments);
+      if (size[0] < 420) size[0] = 420;
     };
     const onExecuted = nodeType.prototype.onExecuted;
     nodeType.prototype.onExecuted = function (output) {
       onExecuted?.apply(this, arguments);
       if (output?.h3remake_data?.[0]) this.h3remakePrompt?.receiveData(JSON.parse(output.h3remake_data[0]));
+      if (output?.h3remake_latents?.[0]) this.h3remakePrompt?.receiveLatentIds(JSON.parse(output.h3remake_latents[0]));
     };
     const onConnectionsChange = nodeType.prototype.onConnectionsChange;
     nodeType.prototype.onConnectionsChange = function () {

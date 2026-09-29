@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-h3videoremake"
-description = "Multi-clip MiniMax H3 videos: Media Input (upload up to 9 reference images and 3 reference audios, group them into subjects, optional LLM descriptions), Image/Audio Aggregators for MiniMaxH3ReferenceToVideo, and a Prompt editor for the six H3 sections."
+description = "Multi-clip MiniMax H3 videos: Media Input (upload up to 9 reference images and 3 reference audios, group them into subjects, optional LLM descriptions), Image/Audio Aggregators for MiniMaxH3ReferenceToVideo, a Prompt editor for the six H3 sections with per-clip general params (resolution, 1/2-phase upscaling), and Save/Load Clip Latent nodes around the sampler for clip-to-clip latent continuity."
 version = "0.1.0"
 readme = "README.md"
 requires-python = ">=3.10"

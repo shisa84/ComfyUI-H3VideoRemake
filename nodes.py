@@ -218,6 +218,9 @@ class H3RemakePrompt(io.ComfyNode):
         manual = general.get("validation") != "auto"
 
         clip_number = index + 1
+        if manual and index > 0 and not clips[index - 1].get("valid", False):
+            raise ValueError(f"H3 Remake · Prompt: clip {index} needs to be marked Valid before generating "
+                             f"clip {clip_number} (validation: manual). Mark it valid, or switch to auto.")
         use_previous_latent = index > 0 and (not manual or clips[index - 1].get("valid", False))
 
         # Which clips actually have a saved latent, so the editor only lets those be marked valid. This only

@@ -46,7 +46,11 @@ Same for audio: one audio list (e.g. **Media Input**'s `audios`) onto `ref_audio
 
 Manages the clips and edits their prompts. Connect **Media Input**'s `data` to `data`.
 
-**General params** (top): `1 phase` / `2 phase` sets whether there's an upscale stage. Resolution is computed the same way as the core **Resolution Selector** node, from an aspect ratio preset and a megapixel target (`width`/`height` shown next to it): the base one always, plus an upscale one (its own megapixel target, same aspect ratio) once `2 phase` is on. `project folder` is where clip latents are saved/loaded (a subfolder under ComfyUI's `output`, read by **H3 Remake · Save/Load Clip Latent** below). `Manual` / `Auto` sets how continuity trusts a saved latent (see below).
+**General params** (top): `1 phase` / `2 phase` sets whether there's an upscale stage. Resolution is computed the same way as the core **Resolution Selector** node, from an aspect ratio preset and a megapixel target (`width`/`height` shown next to it): the base one always, plus an upscale one (its own megapixel target, same aspect ratio) once `2 phase` is on. `project folder` is where clip latents are saved/loaded (a subfolder under ComfyUI's `output`, read by **H3 Remake · Save/Load Clip Latent** below).
+
+`Manual` / `Auto` sets how continuity trusts a saved latent for a normal, one-clip-at-a-time run: **Manual** *blocks generation outright* if the previous clip isn't marked Valid yet (fails with a clear error instead of quietly generating without continuity) — a deliberate stop-and-check gate; **Auto** trusts the file as soon as it exists on disk, no gate.
+
+**▶ Chain** generates every not-yet-valid clip in order, unsupervised: it starts at the first clip without a `✓`, runs it, marks it valid on success, moves to the next, and repeats to the end. Since nothing is manually reviewed while it runs, it marks each clip valid itself as it goes — regardless of the Manual/Auto setting, which only affects individually-triggered runs outside the chain. Stops at the first failed clip; click **■ Stop** to stop after the clip currently running instead of continuing. Disabled once every clip is already valid.
 
 **Clips**: one block per clip with its duration (`Clip 1 · 5.0s`…), `✓` once marked valid; **+ Add clip** adds one. Choose a clip to open its editor below; the header of the chosen clip sets its duration in seconds, a **Valid** checkbox, moves it left/right, duplicates (starts unvalidated) or deletes it. Each clip has its own prompt.
 

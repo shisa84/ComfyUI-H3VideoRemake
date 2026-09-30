@@ -28,6 +28,10 @@ const CSS = `
 .h3p-general input[type=text]{flex:1;min-width:90px;background:#222;color:#ddd;border:1px solid #555;border-radius:4px;padding:2px 4px;font-size:11px}
 .h3p-general select{background:#222;color:#ddd;border:1px solid #555;border-radius:4px;padding:2px 4px;font-size:11px}
 .h3p-general .sep{color:#555}
+.h3p-chain{border:1px solid #444;border-radius:5px;background:#222;color:#ccc;font-size:11px;padding:3px 8px;cursor:pointer}
+.h3p-chain:hover:not(:disabled){border-color:#888}
+.h3p-chain:disabled{opacity:.4;cursor:default}
+.h3p-chain.running{background:#3a2d52;color:#fff;border-color:#8a5cd0}
 .h3p-clips{display:flex;flex-wrap:wrap;gap:4px;flex:0 0 auto;max-height:70px;overflow-y:auto}
 .h3p-clip{border:1px solid #444;border-left:4px solid #8a5cd0;border-radius:5px;background:#222;color:#ccc;font-size:11px;
   padding:4px 8px;cursor:pointer;white-space:nowrap}
@@ -169,6 +173,8 @@ class PromptEditor {
     this.defaults = defaults;
     this.state = { clips: [newClip(defaults.user)], selected: null, general: defaultGeneral() };
     this.latentIds = new Set(); // clip ids that actually have a saved latent on disk, from the last run
+    this.chainRunning = false;
+    this.chainStopRequested = false;
     this.root = el("div", { class: "h3p" });
     // Keep typing and scrolling inside the editor instead of the canvas.
     this.root.addEventListener("keydown", (e) => e.stopPropagation());
@@ -280,6 +286,14 @@ class PromptEditor {
     const folder = el("input", { type: "text", placeholder: "project folder (under output/)", value: g.project_folder,
       title: "Where each clip's latent is saved/loaded (project_folder/clip_N.latent, under ComfyUI's output folder)." });
     folder.addEventListener("change", () => { g.project_folder = folder.value.trim(); this.changed(); });
+    const chainStart = this.state.clips.findIndex((clip) => !clip.valid);
+    const chainBtn = el("button", {
+      class: `h3p-chain${this.chainRunning ? " running" : ""}`,
+      disabled: !this.chainRunning && chainStart === -1,
+      title: this.chainRunning ? "Stop after the clip currently running"
+        : chainStart === -1 ? "Every clip is already Valid" : `Generate clip ${chainStart + 1} onward, unsupervised`,
+      onclick: () => this.startChain(),
+    }, this.chainRunning ? "■ Stop" : "▶ Chain");
     return el("div", { style: "display:flex;flex-direction:column;gap:4px;flex:0 0 auto" }, [
       el("div", { class: "h3p-general" }, [
         phase, el("span", { class: "sep" }, "|"),
@@ -287,7 +301,7 @@ class PromptEditor {
         ...(g.two_phase ? [el("span", { class: "sep" }, "→"),
           mp("upscale_megapixels", "Upscale megapixels"), el("span", { class: "h3p-hint" }, "MP"), readout(g.upscale_megapixels)] : []),
       ]),
-      el("div", { class: "h3p-general" }, [folder, validation]),
+      el("div", { class: "h3p-general" }, [folder, validation, chainBtn]),
     ]);
   }
 
@@ -402,6 +416,51 @@ class PromptEditor {
       this.latentIds.add(clip.id);
       this.render();
     }
+  }
+
+  // ---------- chain: run every not-yet-valid clip in order, unsupervised ----------
+  waitForRunCompletion() {
+    return new Promise((resolve) => {
+      const api = app.api;
+      const finish = (ok) => (e) => { cleanup(); resolve({ ok, detail: e.detail }); };
+      const onSuccess = finish(true);
+      const onError = finish(false);
+      const onInterrupted = finish(false);
+      function cleanup() {
+        api.removeEventListener("execution_success", onSuccess);
+        api.removeEventListener("execution_error", onError);
+        api.removeEventListener("execution_interrupted", onInterrupted);
+      }
+      api.addEventListener("execution_success", onSuccess);
+      api.addEventListener("execution_error", onError);
+      api.addEventListener("execution_interrupted", onInterrupted);
+    });
+  }
+
+  async startChain() {
+    if (this.chainRunning) {
+      this.chainStopRequested = true;
+      return;
+    }
+    const clips = this.state.clips;
+    const startAt = clips.findIndex((clip) => !clip.valid);
+    if (startAt === -1) return; // every clip is already valid, nothing to do
+    this.chainRunning = true;
+    this.chainStopRequested = false;
+    this.render();
+    for (let i = startAt; i < clips.length && !this.chainStopRequested; i++) {
+      this.selectClip(clips[i].id);
+      const queued = await app.queuePrompt(0, 1);
+      if (!queued) break;
+      const result = await this.waitForRunCompletion();
+      if (!result.ok) break; // stop the chain on the first failure
+      clips[i].valid = true; // unsupervised: treat a successful run as approved
+      this.changed();
+      this.render();
+    }
+    this.chainRunning = false;
+    this.chainStopRequested = false;
+    this.render();
   }
 
   renderChips() {

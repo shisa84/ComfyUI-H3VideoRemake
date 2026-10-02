@@ -107,3 +107,67 @@ def delete_take(project_folder: str, clip_index: int, take: int, video_paths: li
     if removed:
         os.remove(path)
     return removed + _delete_videos(video_paths)
+
+
+def _video_group_base(filename: str) -> str | None:
+    """filename's VHS_VideoCombine group key: the same take's keyframe .png, silent video and audio-muxed
+    version all share this (e.g. "video_00014.mp4" and "video_00014-audio.mp4" both give "video_00014")."""
+    stem, ext = os.path.splitext(filename)
+    if not ext:
+        return None
+    return stem[:-len("-audio")] if stem.endswith("-audio") else stem
+
+
+def _video_file_priority(filename: str) -> int:
+    """VHS's own append order within a group: keyframe png, then silent video, then audio-muxed - matches
+    what H3RemakeSaveClipLatent already records for a take whose event wasn't missed."""
+    if filename.endswith(".png"):
+        return 0
+    stem, _ = os.path.splitext(filename)
+    return 2 if stem.endswith("-audio") else 1
+
+
+# A take's Save Clip Latent always runs right after its video-save node, in the same execution - so a take
+# missing from the editor (its event was missed, e.g. the tab wasn't open) can still be matched to its video
+# group by proximity: the nearest unclaimed group written just before that take's .latent file.
+_RESYNC_TOLERANCE_SECONDS = 120
+
+
+def resync_takes(project_folder: str, clip_index: int, known_takes: list[int], known_video_paths: list[str]) -> list[dict]:
+    """Takes on disk for this clip that aren't in known_takes, with a best-effort video match for each (empty
+    video_paths if none is found within tolerance) - for rebuilding the editor's take list after a missed event."""
+    folder = _project_dir(project_folder)
+    if not os.path.isdir(folder):
+        return []
+    known_takes = set(known_takes)
+    known_names = {os.path.basename(p) for p in known_video_paths}
+
+    take_mtimes: dict[int, float] = {}
+    groups: dict[str, list[tuple[str, float]]] = {}
+    for name in os.listdir(folder):
+        full = os.path.join(folder, name)
+        if not os.path.isfile(full):
+            continue
+        m = _TAKE_PATTERN.match(name)
+        if m and int(m.group(1)) == clip_index:
+            take_mtimes[int(m.group(2))] = os.path.getmtime(full)
+        elif not m and name not in known_names:
+            base = _video_group_base(name)
+            if base is not None:
+                groups.setdefault(base, []).append((name, os.path.getmtime(full)))
+    group_mtimes = {base: max(mt for _, mt in files) for base, files in groups.items()}
+
+    missing_takes = sorted(t for t in take_mtimes if t not in known_takes)
+    results = []
+    for take in missing_takes:
+        take_mtime = take_mtimes[take]
+        candidates = [base for base, mt in group_mtimes.items() if mt <= take_mtime
+                     and take_mtime - mt <= _RESYNC_TOLERANCE_SECONDS]
+        video_paths = []
+        if candidates:
+            best = max(candidates, key=lambda base: group_mtimes[base])
+            files = sorted(groups.pop(best), key=lambda nm_mt: _video_file_priority(nm_mt[0]))
+            del group_mtimes[best]
+            video_paths = [relative_to_output(os.path.join(folder, name)) for name, _ in files]
+        results.append({"take": take, "video_paths": video_paths})
+    return results

@@ -406,8 +406,12 @@ class PromptEditor {
   // ---------- takes: every run of the selected clip is a new one, listed here ----------
   renderGenerations() {
     const clip = this.clip;
+    const resyncBtn = el("button", { class: "h3p-fill", disabled: !this.state.general.project_folder,
+      title: "Rebuild this clip's take list from the .latent and video files already on disk - recovers takes " +
+             "whose save event the editor missed (e.g. the tab wasn't open).",
+      onclick: () => this.resyncFromDisk() }, "⟳ Resync from disk");
     if (!clip.generations.length) {
-      return el("div", { class: "h3p-gens" }, [el("span", { class: "h3p-hint" }, "No takes yet - run the workflow to generate one.")]);
+      return el("div", { class: "h3p-gens" }, [el("span", { class: "h3p-hint" }, "No takes yet - run the workflow to generate one."), resyncBtn]);
     }
     const chips = clip.generations.map((g) => {
       const label = `${g.id === clip.activeGeneration ? "✓ " : ""}Take ${g.take}`;
@@ -438,6 +442,7 @@ class PromptEditor {
       title: canDeleteOthers ? "Delete every other take's latent and video for this clip" : "Select a take first",
       onclick: () => this.deleteOtherTakes(),
     }, "Delete others"));
+    chips.push(resyncBtn);
     return el("div", { class: "h3p-gens" }, chips);
   }
 
@@ -483,6 +488,32 @@ class PromptEditor {
     }
     clip.generations = clip.generations.filter((g) => g.id !== generation.id);
     if (clip.activeGeneration === generation.id) clip.activeGeneration = null;
+    this.changed();
+    this.render();
+  }
+
+  async resyncFromDisk() {
+    const clip = this.clip;
+    const knownVideoPaths = this.state.clips.flatMap((c) => (c.generations || []).flatMap((g) => g.videoPaths || []));
+    const response = await fetch("/h3remake/resync_takes", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        project_folder: this.state.general.project_folder,
+        clip_index: this.clipIndex + 1,
+        known_takes: clip.generations.map((g) => g.take),
+        known_video_paths: knownVideoPaths,
+      }),
+    });
+    if (!response.ok) {
+      console.error("H3VideoRemake: resync_takes failed", response.status, await response.text());
+      return;
+    }
+    const { takes } = await response.json();
+    for (const t of takes) {
+      clip.generations.push({ id: uid(), take: t.take, videoPath: t.video_paths[t.video_paths.length - 1] || "", videoPaths: t.video_paths });
+    }
+    clip.generations.sort((a, b) => a.take - b.take);
     this.changed();
     this.render();
   }

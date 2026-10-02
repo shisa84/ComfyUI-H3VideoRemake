@@ -48,19 +48,19 @@ Manages the clips and edits their prompts. Connect **Media Input**'s `data` to `
 
 **General params** (top): `1 phase` / `2 phase` sets whether there's an upscale stage. Resolution is computed the same way as the core **Resolution Selector** node, from an aspect ratio preset and a megapixel target (`width`/`height` shown next to it): the base one always, plus an upscale one (its own megapixel target, same aspect ratio) once `2 phase` is on. `project folder` is where clip latents are saved/loaded (a subfolder under ComfyUI's `output`, read by **H3 Remake · Save/Load Clip Latent** below).
 
-`Manual` / `Auto` sets how continuity trusts a saved latent for a normal, one-clip-at-a-time run: **Manual** *blocks generation outright* if the previous clip isn't marked Valid yet (fails with a clear error instead of quietly generating without continuity) — a deliberate stop-and-check gate; **Auto** trusts the file as soon as it exists on disk, no gate.
+`Manual` / `Auto` sets how continuity picks a take for a normal, one-clip-at-a-time run: **Manual** *blocks generation outright* if the previous clip has no take selected yet (fails with a clear error instead of quietly generating without continuity) — a deliberate stop-and-check gate; **Auto** always uses the previous clip's latest take, no selection needed.
 
-**▶ Chain** generates every not-yet-valid clip in order, unsupervised: it starts at the first clip without a `✓`, runs it, marks it valid on success, moves to the next, and repeats to the end. Since nothing is manually reviewed while it runs, it marks each clip valid itself as it goes — regardless of the Manual/Auto setting, which only affects individually-triggered runs outside the chain. Stops at the first failed clip; click **■ Stop** to stop after the clip currently running instead of continuing. Disabled once every clip is already valid.
+**▶ Chain** generates every clip without a selected take, in order, unsupervised: it starts at the first one, runs it, selects the take it just made on success, moves to the next, and repeats to the end. Since nothing is manually reviewed while it runs, it picks the result itself as it goes — regardless of the Manual/Auto setting, which only affects individually-triggered runs outside the chain. Stops at the first failed clip; click **■ Stop** to stop after the clip currently running instead of continuing. Disabled once every clip already has a take selected.
 
-**Clips**: one block per clip with its duration (`Clip 1 · 5.0s`…), `✓` once marked valid; **+ Add clip** adds one. Choose a clip to open its editor below; the header of the chosen clip sets its duration in seconds, a **Valid** checkbox, moves it left/right, duplicates (starts unvalidated) or deletes it. Each clip has its own prompt.
-
-**Valid** is greyed out until that clip actually has a saved latent on disk — you can't mark a clip valid before anything has been generated for it. Run the workflow through **H3 Remake · Save Clip Latent** once and it unlocks right away, no need to run Prompt a second time.
+**Clips**: one block per clip with its duration (`Clip 1 · 5.0s`…), `✓` once a take is selected; **+ Add clip** adds one. Choose a clip to open its editor below; the header of the chosen clip sets its duration in seconds, moves it left/right, duplicates (starts with no takes) or deletes it. Each clip has its own prompt.
 
 **Editor** (chosen clip):
 - One text with the six H3 section headers: `subject_definitions:`, `summary:`, `retention_analysis:`, `detailed_description:`, `overall_soundscape:`, `non_diegetic_music:`.
 - As soon as the connected Media Input has run, the sections left empty are filled with its `data` (in every clip), so the text can be seen and edited. **Fill from data** replaces the sections of the version shown with Media Input's latest `data` (e.g. after changing subjects). At run time, a section still empty is taken from `data`.
 - The chips above the text insert `<Picture N>`, `<Subject N>` and `<Audio N>` from the connected Media Input at the cursor; tags, `[Shot N]` and section headers are highlighted.
 - **A / B**: two versions of the clip's text; the selected one is output. B starts as a copy of A.
+
+**Takes** (bottom): every run of the selected clip is a new, numbered take — queue the same clip 10 times (e.g. set the native Run count to 10) and 10 takes show up here, nothing is overwritten. A take with a recorded video shows a thumbnail (its last/most complete file - the audio-muxed one, if there is one); click it to open that file full-size in a modal, with the take number and every file recorded for it (latent, and all of `video_filenames`) shown (Escape, the ✕, or clicking outside it closes it). Click the take itself (not the thumbnail) to select it (click again to deselect); the selected take is what the next clip's continuity uses, and what shows the `✓` in the clips row above. **Delete others** (enabled once one is selected) removes every other take's latent *and every one of its recorded video files* for this clip.
 
 | Output | |
 |---|---|
@@ -69,25 +69,22 @@ Manages the clips and edits their prompts. Connect **Media Input**'s `data` to `
 | `width` / `height` | The general params' base resolution. |
 | `two_phase` | Whether the general params ask for an upscale phase. |
 | `upscale_width` / `upscale_height` | The general params' upscale resolution (meaningful only when `two_phase` is on). |
-| `project_folder` / `clip_index` / `use_previous_latent` | For **H3 Remake · Save/Load Clip Latent**, below. |
+| `project_folder` / `clip_index` / `previous_take` | For **H3 Remake · Save/Load Clip Latent**, below. |
 
 ### H3 Remake · Save Clip Latent / H3 Remake · Load Clip Latent
 
-Two separate nodes, not one — **Load** goes before the sampler (its `continuity_latent` feeds the clip's init/continuity latent), **Save** goes after it (its `latent` input comes from the sampler's output). Both take `project_folder` and `clip_index` from Prompt; Load also takes `use_previous_latent`.
+Two separate nodes, not one — **Load** goes before the sampler (its `continuity_latent` feeds the clip's init/continuity latent), **Save** goes after it (its `latent` input comes from the sampler's output). Both take `project_folder` and `clip_index` from Prompt; Load also takes `previous_take`.
 
 They have to be two nodes. A single node that both received the sampler's output (to save it) and fed the sampler its continuity latent (to use it) would depend on its own result through the sampler in between — ComfyUI refuses that as a dependency cycle (*"Dependency cycle detected"*), and that's exactly what happened the first time this was tried as one node. Splitting Save and Load like this is the same fix ComfyUI-H3-Motion-Context uses, for the same reason.
 
-**Save** writes the clip's latent to `project_folder/clip_N.latent` (MiniMax H3's audio+video latent pair) whenever it runs; it has no output, so nothing can be wired back into it. **Load** reads the *previous* clip's saved latent when `use_previous_latent` is true:
-- **Auto**: true as soon as that file exists on disk.
-- **Manual**: true only once the previous clip's **Valid** checkbox is ticked in Prompt — so you review a clip before the next one builds on it.
-- False for the first clip either way (there's no previous one); `continuity_latent` is then empty.
+**Save** writes the clip's latent to `project_folder/clip_N_take_K.latent` every time it runs (K auto-numbered — each run is a new take, nothing is overwritten) and, if `video_filenames` is connected, records every file that run's video-save node wrote for Prompt's take list below. Wire `video_filenames` directly from `VHS_VideoCombine`'s `Filenames` output — not through `VHS_SelectFilename`, which would only keep one of the files it wrote (`VHS_VideoCombine` can produce several per run: a first-frame `.png`, a silent video, and an audio-muxed version). Save converts each of those (always absolute filesystem paths) to one relative to ComfyUI's `output` folder before recording it (what the thumbnail/player/deletion actually need). Save has no graph output, so nothing can be wired back into it.
 
-Load only reads Prompt's outputs and a file — never the sampler's output — so it can safely feed the sampler without looping back.
+**Load** reads the *previous* clip's take number `previous_take` (0 means nothing to load — the first clip, or manual mode with no take selected yet) and outputs its saved latent, or empty if there's nothing to load. It only reads Prompt's outputs and a file — never the sampler's output — so it can safely feed the sampler without looping back.
 
 | Output | |
 |---|---|
 | Save: none | Runs for its side effect (`is_output_node`). |
-| Load: `continuity_latent` | The previous clip's saved latent when `use_previous_latent` is true, else empty. |
+| Load: `continuity_latent` | The take `previous_take` of the previous clip's saved latent, or empty if `previous_take` is 0. |
 
 ### Skipping a previous-clip-only branch (e.g. H3 Motion Context)
 
@@ -97,8 +94,8 @@ Use ComfyUI core's **If/Else Switch** node (`utilities/logic`, `switch`/`on_true
 
 **Not `easy ifElse`** (ComfyUI-Easy-Use, "If else"): despite the same lazy mechanism, its `on_true`/`on_false` aren't marked `optional` in its schema, so ComfyUI's validator refuses to queue unless *both* are connected — defeating the point of leaving `on_false` empty. Core's If/Else Switch declares both `optional=True` and actually allows it.
 
-Wiring, one per group (both can share the same `switch` source, but each needs its own `on_true` — a different Resize output per group):
-- `switch`: Prompt's `use_previous_latent`.
+`switch` needs a boolean, and Prompt's `previous_take` is an int (0 = nothing to load) — add a **Compare** node (`a > 0`, `a` = `previous_take`) in between to get one. Both groups can share that same boolean (one Compare node is enough), but each needs its own `on_true` — a different Resize output per group:
+- `switch`: `previous_take > 0` (via Compare).
 - `on_true` (lazy): that group's `H3 Motion Context Resize` output. Only evaluated when `switch` is true, so `Load Latent`/`Resize` never run on clip 1 — no risk of `Resize` erroring on an empty latent.
 - `on_false`: leave unconnected (outputs a plain empty value).
 - Output → that group's `H3 Motion Context`'s `context_latent`.

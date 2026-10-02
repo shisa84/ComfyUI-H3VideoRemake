@@ -7,7 +7,7 @@ import math
 from comfy_api.latest import io
 from comfy_extras.nodes_resolution import ASPECT_RATIOS
 
-from .clip_latent import clip_latent_exists, load_clip_latent, save_clip_latent
+from .clip_latent import load_clip_latent, next_take_number, relative_to_output, save_clip_latent
 from .describe import describe_image
 from .media import MAX_AUDIOS, MAX_IMAGES, build_media
 from .prompt import build_prompt_data
@@ -16,9 +16,13 @@ from .prompt_sections import DEFAULT_USER_PROMPT, assemble_prompt, data_sections
 # Rendered by web/h3remake_media.js; the value is the JSON state of the picker.
 MediaData = io.Custom("H3REMAKE_MEDIA_DATA")
 # Rendered by web/h3remake_prompt.js; the value is JSON: {"clips": [{"id", "duration", "variant", "user_a",
-# "user_b", "valid"}], "selected", "general": {"aspect_ratio", "megapixels", "two_phase", "upscale_megapixels",
-# "project_folder", "validation"}}.
+# "user_b", "generations": [{"id", "take", "videoPath", "videoPaths"}], "activeGeneration"}], "selected",
+# "general": {"aspect_ratio", "megapixels", "two_phase", "upscale_megapixels", "project_folder", "validation"}}.
 PromptData = io.Custom("H3REMAKE_PROMPT_DATA")
+# ComfyUI-VideoHelperSuite's VHS_VideoCombine output: (save_to_output: bool, file_paths: list[str]). Reading
+# it directly (instead of going through VHS_SelectFilename) gets every file one combine call wrote - the
+# silent video, the audio-muxed version, and the first-frame png - not just whichever one an index picks.
+VhsFilenames = io.Custom("VHS_FILENAMES")
 
 RESOLUTION_MULTIPLE = 32  # MiniMax H3's per-axis rounding (comfy_extras/nodes_minimax_h3.py)
 
@@ -154,8 +158,8 @@ class H3RemakePrompt(io.ComfyNode):
             description="Manage the clips (duration and prompt each) and edit the chosen clip's six H3 prompt sections "
                         "(A/B versions). Sections left empty are filled from Media Input's data; the prompt output always "
                         "has all six, in H3 order. Also holds general params (phase, resolutions, validation mode); wire "
-                        "project_folder/clip_index/use_previous_latent to H3 Remake · Save/Load Clip Latent for "
-                        "clip-to-clip continuity (can't be on this node: it would make a dependency cycle).",
+                        "project_folder/clip_index/previous_take to H3 Remake · Save/Load Clip Latent for clip-to-clip "
+                        "continuity (can't be on this node: it would make a dependency cycle).",
             inputs=[
                 io.String.Input("data", force_input=True, optional=True,
                                 tooltip="Media Input's data: supplies subject_definitions and retention_analysis, "
@@ -182,19 +186,13 @@ class H3RemakePrompt(io.ComfyNode):
                                  tooltip="The general params' project folder, for H3 Remake · Clip Latent."),
                 io.Int.Output(id="clip_index", display_name="clip_index",
                              tooltip="The chosen clip's 1-based position, for H3 Remake · Clip Latent."),
-                io.Boolean.Output(id="use_previous_latent", display_name="use_previous_latent",
-                                  tooltip="Whether H3 Remake · Clip Latent should load the previous clip's saved latent: "
-                                          "true once it exists on disk (validation: auto) or once it's marked valid "
-                                          "(validation: manual). Always false for the first clip."),
+                io.Int.Output(id="previous_take", display_name="previous_take",
+                             tooltip="Which take of the PREVIOUS clip H3 Remake · Load Clip Latent should load: the "
+                                     "selected take (validation: manual) or the latest one (validation: auto), as "
+                                     "clip_{clip_index-1}_take_{previous_take}.latent. 0 (nothing to load) for the "
+                                     "first clip, or in manual mode when no take is selected yet."),
             ],
         )
-
-    @classmethod
-    def fingerprint_inputs(cls, **kwargs):
-        # with_latent depends on project_folder's files on disk, which H3 Remake · Save Clip Latent writes
-        # without ever touching one of this node's own inputs - so ComfyUI's normal input-based caching
-        # would keep serving a stale with_latent forever. Always re-run instead.
-        return float("nan")
 
     @classmethod
     def execute(cls, prompt_data, data=None) -> io.NodeOutput:
@@ -218,21 +216,23 @@ class H3RemakePrompt(io.ComfyNode):
         manual = general.get("validation") != "auto"
 
         clip_number = index + 1
-        if manual and index > 0 and not clips[index - 1].get("valid", False):
-            raise ValueError(f"H3 Remake · Prompt: clip {index} needs to be marked Valid before generating "
-                             f"clip {clip_number} (validation: manual). Mark it valid, or switch to auto.")
-        use_previous_latent = index > 0 and (not manual or clips[index - 1].get("valid", False))
-
-        # Which clips actually have a saved latent, so the editor only lets those be marked valid. This only
-        # reads the disk (H3 Remake · Clip Latent, downstream of the sampler, does the actual saving) so it
-        # can't see a save from the run that's still in progress; run again (or just Prompt) to refresh it.
-        with_latent = [c["id"] for i, c in enumerate(clips) if project_folder and clip_latent_exists(project_folder, i + 1)]
+        previous_take = 0
+        if index > 0:
+            previous_generations = clips[index - 1].get("generations") or []
+            if manual:
+                active_id = clips[index - 1].get("activeGeneration")
+                active = next((g for g in previous_generations if g.get("id") == active_id), None)
+                previous_take = int(active["take"]) if active else 0
+            else:
+                previous_take = max((int(g.get("take", 0)) for g in previous_generations), default=0)
+        if manual and index > 0 and previous_take == 0:
+            raise ValueError(f"H3 Remake · Prompt: clip {index} needs a take selected as valid before generating "
+                             f"clip {clip_number} (validation: manual). Select one, or switch to auto.")
 
         # The editor fills its empty sections from these once the run is done (web/h3remake_prompt.js).
         return io.NodeOutput(assemble_prompt(user, data), length, width, height, two_phase, upscale_width, upscale_height,
-                             project_folder, clip_number, use_previous_latent,
-                             ui={"h3remake_data": [json.dumps(data_sections(data))],
-                                 "h3remake_latents": [json.dumps(with_latent)]})
+                             project_folder, clip_number, previous_take,
+                             ui={"h3remake_data": [json.dumps(data_sections(data))]})
 
 
 class H3RemakeSaveClipLatent(io.ComfyNode):
@@ -245,11 +245,17 @@ class H3RemakeSaveClipLatent(io.ComfyNode):
             display_name="H3 Remake · Save Clip Latent",
             category="H3VideoRemake",
             is_output_node=True,
-            description="Place after the sampler. Saves the clip's latent to project_folder/clip_N.latent, read back "
-                        "by H3 Remake · Load Clip Latent for the next clip's continuity. Wire project_folder/clip_index "
-                        "from H3 Remake · Prompt.",
+            description="Place after the sampler. Every run is a new take: saves the clip's latent to "
+                        "project_folder/clip_N_take_K.latent (K auto-numbered) and, if connected, records every file "
+                        "the video-save node wrote for it. Wire project_folder/clip_index from H3 Remake · Prompt, and "
+                        "video_filenames directly from VHS_VideoCombine's Filenames output (not through "
+                        "VHS_SelectFilename, which would only keep one of its files).",
             inputs=[
                 io.Latent.Input("latent", tooltip="This clip's generated latent, from the sampler."),
+                VhsFilenames.Input("video_filenames", optional=True,
+                                   tooltip="This take's saved files (VHS_VideoCombine's Filenames output), for the "
+                                           "clip's take list and for Delete others to clean up every one of them. "
+                                           "Optional: the take is still recorded without it."),
                 io.String.Input("project_folder", force_input=True, tooltip="From H3 Remake · Prompt's project_folder."),
                 io.Int.Input("clip_index", force_input=True, tooltip="From H3 Remake · Prompt's clip_index."),
             ],
@@ -257,12 +263,19 @@ class H3RemakeSaveClipLatent(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, latent, project_folder, clip_index) -> io.NodeOutput:
+    def execute(cls, latent, project_folder, clip_index, video_filenames=None) -> io.NodeOutput:
         if not project_folder:
             return io.NodeOutput()
-        save_clip_latent(project_folder, clip_index, latent)
-        # Lets a connected Prompt node unlock that clip's Valid checkbox right away, without re-running Prompt.
-        return io.NodeOutput(ui={"h3remake_saved": [json.dumps({"clip_index": clip_index})]})
+        take = next_take_number(project_folder, clip_index)
+        save_clip_latent(project_folder, clip_index, take, latent)
+        # VHS_VideoCombine's own paths are absolute; the frontend's /view thumbnail and player need ones
+        # relative to output/, which is what it actually serves files from.
+        video_paths = [relative_to_output(p) for p in (video_filenames[1] if video_filenames else [])]
+        # Lets a connected Prompt node add this take to the clip's list right away, without re-running Prompt.
+        # project_folder rides along so Prompt can match on it even through Get/Set reroutes, where tracing
+        # the actual graph link back to Prompt wouldn't resolve to it.
+        return io.NodeOutput(ui={"h3remake_saved": [json.dumps({
+            "project_folder": project_folder, "clip_index": clip_index, "take": take, "video_paths": video_paths})]})
 
 
 class H3RemakeLoadClipLatent(io.ComfyNode):
@@ -275,28 +288,28 @@ class H3RemakeLoadClipLatent(io.ComfyNode):
             node_id="H3RemakeLoadClipLatent",
             display_name="H3 Remake · Load Clip Latent",
             category="H3VideoRemake",
-            description="Place before the sampler, for the clip's init/continuity latent. Loads the PREVIOUS clip's "
-                        "saved latent when use_previous_latent says to. Wire project_folder/clip_index/"
-                        "use_previous_latent from H3 Remake · Prompt (not the sampler's own latent output: that would "
-                        "make a dependency cycle through this same clip's generation).",
+            description="Place before the sampler, for the clip's init/continuity latent. Loads the take "
+                        "previous_take of the PREVIOUS clip. Wire project_folder/clip_index/previous_take from "
+                        "H3 Remake · Prompt (not the sampler's own latent output: that would make a dependency cycle "
+                        "through this same clip's generation).",
             inputs=[
                 io.String.Input("project_folder", force_input=True, tooltip="From H3 Remake · Prompt's project_folder."),
                 io.Int.Input("clip_index", force_input=True, tooltip="From H3 Remake · Prompt's clip_index (this clip; "
                                                                      "the previous one's file, clip_index - 1, is loaded)."),
-                io.Boolean.Input("use_previous_latent", force_input=True,
-                                 tooltip="From H3 Remake · Prompt's use_previous_latent."),
+                io.Int.Input("previous_take", force_input=True,
+                            tooltip="From H3 Remake · Prompt's previous_take. 0 means nothing to load."),
             ],
             outputs=[
                 io.Latent.Output(id="continuity_latent", display_name="continuity_latent",
-                                 tooltip="The previous clip's saved latent when use_previous_latent is true, else empty."),
+                                 tooltip="The previous clip's selected take's saved latent, or empty if previous_take is 0."),
             ],
         )
 
     @classmethod
-    def execute(cls, project_folder, clip_index, use_previous_latent) -> io.NodeOutput:
+    def execute(cls, project_folder, clip_index, previous_take) -> io.NodeOutput:
         continuity = None
-        if use_previous_latent and project_folder and clip_index > 1:
-            continuity = load_clip_latent(project_folder, clip_index - 1)
+        if previous_take > 0 and project_folder and clip_index > 1:
+            continuity = load_clip_latent(project_folder, clip_index - 1, previous_take)
         return io.NodeOutput(continuity)
 
 

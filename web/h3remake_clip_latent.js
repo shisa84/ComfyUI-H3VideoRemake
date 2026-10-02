@@ -15,8 +15,9 @@ app.registerExtension({
       onExecuted?.apply(this, arguments);
       const raw = output?.h3remake_saved?.[0];
       if (!raw) return;
-      const { clip_index } = JSON.parse(raw);
-      window.dispatchEvent(new CustomEvent("h3remake:latent-saved", { detail: { node: this, clip_index } }));
+      const { project_folder, clip_index, take, video_paths } = JSON.parse(raw);
+      window.dispatchEvent(new CustomEvent("h3remake:latent-saved",
+        { detail: { node: this, project_folder, clip_index, take, video_paths } }));
     };
   },
 });

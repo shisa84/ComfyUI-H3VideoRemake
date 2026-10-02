@@ -7,6 +7,7 @@
 // filled from data; "Fill from data" overwrites them with the latest data.
 // The widget value is the JSON state read by nodes.py (H3RemakePrompt).
 import { app } from "../../scripts/app.js";
+import { api } from "../../scripts/api.js";
 import { baseName, subjectColor, viewUrl } from "./h3remake_media.js";
 
 const NODE_NAME = "H3RemakePrompt";
@@ -52,6 +53,20 @@ const CSS = `
 .h3p-fill{border:1px solid #444;border-radius:5px;background:#222;color:#ccc;font-size:11px;padding:3px 8px;cursor:pointer}
 .h3p-fill:hover:not(:disabled){border-color:#888}
 .h3p-fill:disabled{opacity:.4;cursor:default}
+.h3p-gens{display:flex;flex-wrap:wrap;gap:4px;flex:0 0 auto;align-items:center;border-top:1px dashed #444;padding-top:6px}
+.h3p-gen{display:inline-flex;align-items:center;gap:6px;border:1px solid #444;border-radius:5px;background:#222;color:#ccc;
+  font-size:11px;padding:3px 8px 3px 3px;cursor:pointer;white-space:nowrap}
+.h3p-gen:hover{border-color:#888}
+.h3p-gen.active{background:#2d4a33;color:#fff;border-color:#5fb878}
+.h3p-gen-thumb{width:56px;height:32px;object-fit:cover;border-radius:3px;background:#000;cursor:zoom-in}
+.h3p-gen-del{border:1px solid #444;border-radius:5px;background:#2a1414;color:#f08080;font-size:11px;padding:3px 8px;cursor:pointer}
+.h3p-gen-del:hover:not(:disabled){border-color:#f08080}
+.h3p-gen-del:disabled{opacity:.35;cursor:default}
+.h3p-modal{position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:10000;display:flex;align-items:center;justify-content:center}
+.h3p-modal-video{max-width:90vw;max-height:90vh;border-radius:8px}
+.h3p-modal-close{position:fixed;top:16px;right:24px;border:0;background:none;color:#fff;font-size:28px;cursor:pointer;line-height:1}
+.h3p-modal-info{position:fixed;bottom:16px;left:24px;background:rgba(0,0,0,.6);color:#ddd;font:12px/1.6 ui-monospace,Consolas,monospace;
+  padding:8px 12px;border-radius:6px;max-width:70vw;word-break:break-all}
 .h3p-chips{display:flex;flex-wrap:wrap;gap:4px;flex:0 0 auto;max-height:90px;overflow-y:auto}
 .h3p-chip{display:flex;align-items:center;gap:4px;border:1px solid #444;border-radius:5px;background:#222;color:#ddd;
   font-size:11px;padding:2px 6px 2px 2px;cursor:pointer}
@@ -128,7 +143,8 @@ function splitSections(text) {
 
 const uid = () => Math.random().toString(36).slice(2, 10);
 const DEFAULT_DURATION = 5; // seconds, about H3's 124-frame default
-const newClip = (user) => ({ id: uid(), duration: DEFAULT_DURATION, variant: "a", user_a: user, user_b: "", valid: false });
+const newClip = (user) => ({ id: uid(), duration: DEFAULT_DURATION, variant: "a", user_a: user, user_b: "",
+  generations: [], activeGeneration: null }); // generations: [{id, take, videoPath, videoPaths}]
 const defaultGeneral = () => ({ aspect_ratio: "16:9 (Widescreen)", megapixels: 1.0, two_phase: false, upscale_megapixels: 4.0,
   project_folder: "", validation: "manual" });
 
@@ -167,12 +183,43 @@ function sourceMedia(node) {
   return origin?.type === MEDIA_NODE ? origin : null;
 }
 
+// A take's video, saved under ComfyUI's output folder (unlike h3remake_media.js's viewUrl, which is for
+// uploaded reference media under input).
+function outputUrl(videoPath) {
+  const slash = videoPath.lastIndexOf("/");
+  const filename = slash >= 0 ? videoPath.slice(slash + 1) : videoPath;
+  const subfolder = slash >= 0 ? videoPath.slice(0, slash) : "";
+  return api.apiURL(`/view?filename=${encodeURIComponent(filename)}&type=output&subfolder=${encodeURIComponent(subfolder)}`);
+}
+
+// Matches clip_latent.py's _clip_latent_path naming - not sent over the wire, just mirrored for display.
+const pad3 = (n) => String(n).padStart(3, "0");
+const latentPathFor = (projectFolder, clipNumber, take) => `${projectFolder}/clip_${pad3(clipNumber)}_take_${pad3(take)}.latent`;
+
+function openVideoModal(url, info) {
+  const video = el("video", { src: url, controls: true, autoplay: true, class: "h3p-modal-video" });
+  const infoPanel = info ? el("div", { class: "h3p-modal-info" }, [
+    el("div", {}, `Take ${info.take}`),
+    el("div", {}, `Latent: ${info.latentPath}`),
+    ...(info.videoPaths?.length ? info.videoPaths.map((p) => el("div", {}, `Video: ${p}`))
+      : [el("div", {}, "Video: (not recorded)")]),
+  ]) : null;
+  const overlay = el("div", { class: "h3p-modal", onclick: (e) => { if (e.target === overlay) close(); } },
+    [video, infoPanel, el("button", { class: "h3p-modal-close", onclick: () => close() }, "✕")]);
+  const onKey = (e) => { if (e.key === "Escape") close(); };
+  function close() {
+    overlay.remove();
+    document.removeEventListener("keydown", onKey);
+  }
+  document.addEventListener("keydown", onKey);
+  document.body.append(overlay);
+}
+
 class PromptEditor {
   constructor(node, defaults) {
     this.node = node;
     this.defaults = defaults;
     this.state = { clips: [newClip(defaults.user)], selected: null, general: defaultGeneral() };
-    this.latentIds = new Set(); // clip ids that actually have a saved latent on disk, from the last run
     this.chainRunning = false;
     this.chainStopRequested = false;
     this.root = el("div", { class: "h3p" });
@@ -184,9 +231,14 @@ class PromptEditor {
     window.addEventListener("h3remake:media-changed", this.onMediaChanged);
     this.onData = (e) => { if (e.detail === sourceMedia(this.node)) this.receiveData(e.detail.h3remakeData); };
     window.addEventListener("h3remake:data", this.onData);
-    // A connected Save Clip Latent runs after Prompt in the same queue, so Prompt can't see the save by
-    // re-executing itself; it tells us directly instead (see h3remake_clip_latent.js).
-    this.onLatentSaved = (e) => { if (linkOrigin(e.detail.node, "clip_index") === this.node) this.markClipIndexSaved(e.detail.clip_index); };
+    // A connected Save Clip Latent runs after Prompt in the same queue, so Prompt can't see the new take by
+    // re-executing itself; it tells us directly instead (see h3remake_clip_latent.js). Matched by
+    // project_folder value, not by tracing the graph link back to this node: Save's clip_index/project_folder
+    // often reach it through Get/Set reroutes, which don't resolve back to this node as a link origin.
+    this.onLatentSaved = (e) => {
+      if (!e.detail.project_folder || e.detail.project_folder !== this.state.general.project_folder) return;
+      this.addGeneration(e.detail.clip_index, e.detail.take, e.detail.video_paths);
+    };
     window.addEventListener("h3remake:latent-saved", this.onLatentSaved);
     this.render();
   }
@@ -225,7 +277,7 @@ class PromptEditor {
   }
 
   addClip(copyOf = null) {
-    const clip = copyOf ? { ...copyOf, id: uid(), valid: false } : newClip(this.defaults.user);
+    const clip = copyOf ? { ...copyOf, id: uid(), generations: [], activeGeneration: null } : newClip(this.defaults.user);
     const at = copyOf ? this.clipIndex + 1 : this.state.clips.length;
     this.state.clips.splice(at, 0, clip);
     if (!copyOf && this.data) this.fillClip(clip, false);
@@ -249,8 +301,8 @@ class PromptEditor {
   }
 
   renderClips() {
-    const blocks = this.state.clips.map((clip, i) => el("button", { class: `h3p-clip${clip.id === this.state.selected ? " on" : ""}${clip.valid ? " valid" : ""}`,
-      title: "Edit this clip", onclick: () => this.selectClip(clip.id) }, `${clip.valid ? "✓ " : ""}Clip ${i + 1} · ${Number(clip.duration).toFixed(1)}s`));
+    const blocks = this.state.clips.map((clip, i) => el("button", { class: `h3p-clip${clip.id === this.state.selected ? " on" : ""}${clip.activeGeneration ? " valid" : ""}`,
+      title: "Edit this clip", onclick: () => this.selectClip(clip.id) }, `${clip.activeGeneration ? "✓ " : ""}Clip ${i + 1} · ${Number(clip.duration).toFixed(1)}s`));
     blocks.push(el("button", { class: "h3p-add", onclick: () => this.addClip() }, "+ Add clip"));
     return el("div", { class: "h3p-clips" }, blocks);
   }
@@ -282,16 +334,17 @@ class PromptEditor {
     const validation = segment([["manual", "Manual"], ["auto", "Auto"]], g.validation, (key) => {
       g.validation = key;
       this.changed();
+      this.render();
     });
     const folder = el("input", { type: "text", placeholder: "project folder (under output/)", value: g.project_folder,
       title: "Where each clip's latent is saved/loaded (project_folder/clip_N.latent, under ComfyUI's output folder)." });
     folder.addEventListener("change", () => { g.project_folder = folder.value.trim(); this.changed(); });
-    const chainStart = this.state.clips.findIndex((clip) => !clip.valid);
+    const chainStart = this.state.clips.findIndex((clip) => !clip.activeGeneration);
     const chainBtn = el("button", {
       class: `h3p-chain${this.chainRunning ? " running" : ""}`,
       disabled: !this.chainRunning && chainStart === -1,
       title: this.chainRunning ? "Stop after the clip currently running"
-        : chainStart === -1 ? "Every clip is already Valid" : `Generate clip ${chainStart + 1} onward, unsupervised`,
+        : chainStart === -1 ? "Every clip already has a take selected" : `Generate clip ${chainStart + 1} onward, unsupervised`,
       onclick: () => this.startChain(),
     }, this.chainRunning ? "■ Stop" : "▶ Chain");
     return el("div", { style: "display:flex;flex-direction:column;gap:4px;flex:0 0 auto" }, [
@@ -314,21 +367,76 @@ class PromptEditor {
       this.changed();
       this.render();
     });
-    const hasLatent = this.latentIds.has(clip.id);
-    const valid = el("input", { type: "checkbox", checked: clip.valid, disabled: !hasLatent,
-      title: hasLatent ? "This clip's latent is trusted for the next clip's continuity (Manual validation mode)."
-        : "Run the workflow with latent connected for this clip first (no saved latent for it yet)." });
-    valid.addEventListener("change", () => { clip.valid = valid.checked; this.changed(); this.render(); });
     return el("div", { class: "h3p-clipbar" }, [
       el("span", { class: "name" }, `Clip ${at + 1}`),
       duration, el("span", { class: "h3p-hint" }, "s"),
-      el("label", { class: "h3p-valid" }, [valid, "Valid"]),
       el("span", { style: "flex:1" }),
       el("button", { class: "h3p-icon", title: "Move left", disabled: at === 0, onclick: () => this.moveClip(-1) }, "◀"),
       el("button", { class: "h3p-icon", title: "Move right", disabled: at === count - 1, onclick: () => this.moveClip(1) }, "▶"),
       el("button", { class: "h3p-icon", title: "Duplicate this clip", onclick: () => this.addClip(clip) }, "Duplicate"),
       el("button", { class: "h3p-icon danger", title: "Delete this clip", onclick: () => this.removeClip() }, "Delete"),
     ]);
+  }
+
+  // ---------- takes: every run of the selected clip is a new one, listed here ----------
+  renderGenerations() {
+    const clip = this.clip;
+    if (!clip.generations.length) {
+      return el("div", { class: "h3p-gens" }, [el("span", { class: "h3p-hint" }, "No takes yet - run the workflow to generate one.")]);
+    }
+    const chips = clip.generations.map((g) => {
+      const label = `${g.id === clip.activeGeneration ? "✓ " : ""}Take ${g.take}`;
+      const content = [label];
+      const latentPath = latentPathFor(this.state.general.project_folder, this.clipIndex + 1, g.take);
+      if (g.videoPath) {
+        const url = outputUrl(g.videoPath);
+        const thumb = el("video", { src: url, class: "h3p-gen-thumb", muted: true, preload: "metadata", title: g.videoPath,
+          onclick: (e) => { e.stopPropagation(); openVideoModal(url, { take: g.take, videoPaths: g.videoPaths, latentPath }); } });
+        thumb.addEventListener("loadedmetadata", () => { thumb.currentTime = Math.min(0.1, thumb.duration || 0); });
+        content.unshift(thumb);
+      }
+      return el("button", {
+        class: `h3p-gen${g.id === clip.activeGeneration ? " active" : ""}`,
+        title: g.videoPath || `Take ${g.take}`,
+        onclick: () => {
+          clip.activeGeneration = clip.activeGeneration === g.id ? null : g.id;
+          this.changed();
+          this.render();
+        },
+      }, content);
+    });
+    const canDeleteOthers = !!clip.activeGeneration && clip.generations.length > 1;
+    chips.push(el("button", {
+      class: "h3p-gen-del",
+      disabled: !canDeleteOthers,
+      title: canDeleteOthers ? "Delete every other take's latent and video for this clip" : "Select a take first",
+      onclick: () => this.deleteOtherTakes(),
+    }, "Delete others"));
+    return el("div", { class: "h3p-gens" }, chips);
+  }
+
+  async deleteOtherTakes() {
+    const clip = this.clip;
+    const active = clip.generations.find((g) => g.id === clip.activeGeneration);
+    if (!active) return;
+    const others = clip.generations.filter((g) => g.id !== active.id);
+    const response = await fetch("/h3remake/delete_other_takes", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        project_folder: this.state.general.project_folder,
+        clip_index: this.clipIndex + 1,
+        keep_take: active.take,
+        delete_video_paths: others.flatMap((g) => g.videoPaths || []),
+      }),
+    });
+    if (!response.ok) {
+      console.error("H3VideoRemake: delete_other_takes failed", response.status, await response.text());
+      return;
+    }
+    clip.generations = [active];
+    this.changed();
+    this.render();
   }
 
   render() {
@@ -369,6 +477,7 @@ class PromptEditor {
       ]),
       this.chips,
       el("div", { class: "h3p-editor" }, [this.back, this.area]),
+      this.renderGenerations(),
     );
     this.renderChips();
   }
@@ -405,17 +514,15 @@ class PromptEditor {
     this.render();
   }
 
-  receiveLatentIds(ids) {
-    this.latentIds = new Set(ids);
-    this.render();
-  }
-
-  markClipIndexSaved(clipIndex) {
+  addGeneration(clipIndex, take, videoPaths) {
     const clip = this.state.clips[clipIndex - 1];
-    if (clip && !this.latentIds.has(clip.id)) {
-      this.latentIds.add(clip.id);
-      this.render();
-    }
+    if (!clip || clip.generations.some((g) => g.take === take)) return;
+    videoPaths = videoPaths || [];
+    // The last file VHS_VideoCombine wrote is its most complete one (audio-muxed, when there's audio) -
+    // same file it uses for its own preview.
+    clip.generations.push({ id: uid(), take, videoPath: videoPaths[videoPaths.length - 1] || "", videoPaths });
+    this.changed();
+    this.render();
   }
 
   // ---------- chain: run every not-yet-valid clip in order, unsupervised ----------
@@ -443,8 +550,8 @@ class PromptEditor {
       return;
     }
     const clips = this.state.clips;
-    const startAt = clips.findIndex((clip) => !clip.valid);
-    if (startAt === -1) return; // every clip is already valid, nothing to do
+    const startAt = clips.findIndex((clip) => !clip.activeGeneration);
+    if (startAt === -1) return; // every clip already has a take selected, nothing to do
     this.chainRunning = true;
     this.chainStopRequested = false;
     this.render();
@@ -454,7 +561,9 @@ class PromptEditor {
       if (!queued) break;
       const result = await this.waitForRunCompletion();
       if (!result.ok) break; // stop the chain on the first failure
-      clips[i].valid = true; // unsupervised: treat a successful run as approved
+      // unsupervised: treat the take this run just created as approved
+      const latest = clips[i].generations.reduce((max, g) => (!max || g.take > max.take ? g : max), null);
+      if (latest) clips[i].activeGeneration = latest.id;
       this.changed();
       this.render();
     }
@@ -525,7 +634,6 @@ app.registerExtension({
     nodeType.prototype.onExecuted = function (output) {
       onExecuted?.apply(this, arguments);
       if (output?.h3remake_data?.[0]) this.h3remakePrompt?.receiveData(JSON.parse(output.h3remake_data[0]));
-      if (output?.h3remake_latents?.[0]) this.h3remakePrompt?.receiveLatentIds(JSON.parse(output.h3remake_latents[0]));
     };
     const onConnectionsChange = nodeType.prototype.onConnectionsChange;
     nodeType.prototype.onConnectionsChange = function () {

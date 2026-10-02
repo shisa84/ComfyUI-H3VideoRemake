@@ -75,6 +75,18 @@ def load_clip_latent(project_folder: str, clip_index: int, take: int) -> dict | 
     return {"samples": samples}
 
 
+def _delete_videos(video_paths: list[str]) -> int:
+    """Delete the given video files, confined to output/."""
+    removed = 0
+    output_root = os.path.abspath(folder_paths.get_output_directory())
+    for video_path in video_paths:
+        full = os.path.abspath(video_path if os.path.isabs(video_path) else os.path.join(output_root, video_path))
+        if os.path.commonpath([output_root, full]) == output_root and os.path.isfile(full):
+            os.remove(full)
+            removed += 1
+    return removed
+
+
 def delete_other_takes(project_folder: str, clip_index: int, keep_take: int, video_paths: list[str]) -> int:
     """Delete every other take's latent for this clip, plus the given video files. Both confined to output/."""
     removed = 0
@@ -85,10 +97,13 @@ def delete_other_takes(project_folder: str, clip_index: int, keep_take: int, vid
             if m and int(m.group(1)) == clip_index and int(m.group(2)) != keep_take:
                 os.remove(os.path.join(folder, name))
                 removed += 1
-    output_root = os.path.abspath(folder_paths.get_output_directory())
-    for video_path in video_paths:
-        full = os.path.abspath(video_path if os.path.isabs(video_path) else os.path.join(output_root, video_path))
-        if os.path.commonpath([output_root, full]) == output_root and os.path.isfile(full):
-            os.remove(full)
-            removed += 1
-    return removed
+    return removed + _delete_videos(video_paths)
+
+
+def delete_take(project_folder: str, clip_index: int, take: int, video_paths: list[str]) -> int:
+    """Delete this one take's latent, plus the given video files. Both confined to output/."""
+    path = _clip_latent_path(project_folder, clip_index, take)
+    removed = 1 if os.path.isfile(path) else 0
+    if removed:
+        os.remove(path)
+    return removed + _delete_videos(video_paths)

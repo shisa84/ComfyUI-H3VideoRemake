@@ -45,6 +45,7 @@ const CSS = `
 .h3p-valid{display:flex;align-items:center;gap:4px;color:#999;cursor:pointer}
 .h3p-clipbar .name{font-weight:600;color:#c9a8f5}
 .h3p-clipbar input{width:60px;background:#222;color:#ddd;border:1px solid #555;border-radius:4px;padding:2px 4px;font-size:11px}
+.h3p-clipbar select{background:#222;color:#ddd;border:1px solid #555;border-radius:4px;padding:2px 4px;font-size:11px}
 .h3p-icon{border:1px solid #444;border-radius:4px;background:#222;color:#ccc;font-size:11px;padding:2px 6px;cursor:pointer}
 .h3p-icon:hover:not(:disabled){border-color:#888}
 .h3p-icon:disabled{opacity:.35;cursor:default}
@@ -67,6 +68,9 @@ const CSS = `
 .h3p-modal-close{position:fixed;top:16px;right:24px;border:0;background:none;color:#fff;font-size:28px;cursor:pointer;line-height:1}
 .h3p-modal-info{position:fixed;bottom:16px;left:24px;background:rgba(0,0,0,.6);color:#ddd;font:12px/1.6 ui-monospace,Consolas,monospace;
   padding:8px 12px;border-radius:6px;max-width:70vw;word-break:break-all}
+.h3p-modal-delete{display:block;margin-top:6px;border:1px solid #633;border-radius:4px;background:#2a1414;color:#f08080;
+  font:12px ui-monospace,Consolas,monospace;padding:4px 8px;cursor:pointer}
+.h3p-modal-delete:hover{border-color:#f08080}
 .h3p-chips{display:flex;flex-wrap:wrap;gap:4px;flex:0 0 auto;max-height:90px;overflow-y:auto}
 .h3p-chip{display:flex;align-items:center;gap:4px;border:1px solid #444;border-radius:5px;background:#222;color:#ddd;
   font-size:11px;padding:2px 6px 2px 2px;cursor:pointer}
@@ -144,9 +148,11 @@ function splitSections(text) {
 const uid = () => Math.random().toString(36).slice(2, 10);
 const DEFAULT_DURATION = 5; // seconds, about H3's 124-frame default
 const newClip = (user) => ({ id: uid(), duration: DEFAULT_DURATION, variant: "a", user_a: user, user_b: "",
-  generations: [], activeGeneration: null }); // generations: [{id, take, videoPath, videoPaths}]
+  generations: [], activeGeneration: null, continuityFrom: null });
+// generations: [{id, take, videoPath, videoPaths}]. continuityFrom: id of the earlier clip to continue from,
+// or null for the default (the immediately previous clip).
 const defaultGeneral = () => ({ aspect_ratio: "16:9 (Widescreen)", megapixels: 1.0, two_phase: false, upscale_megapixels: 4.0,
-  project_folder: "", validation: "manual" });
+  project_folder: "", validation: "manual", draft: false, draft_megapixels: 0.1 });
 
 // Same presets and formula as the core Resolution Selector node (comfy_extras/nodes_resolution.py).
 const ASPECT_RATIOS = { "1:1 (Square)": [1, 1], "2:3 (Portrait Photo)": [2, 3], "3:2 (Photo)": [3, 2],
@@ -203,6 +209,7 @@ function openVideoModal(url, info) {
     el("div", {}, `Latent: ${info.latentPath}`),
     ...(info.videoPaths?.length ? info.videoPaths.map((p) => el("div", {}, `Video: ${p}`))
       : [el("div", {}, "Video: (not recorded)")]),
+    ...(info.onDelete ? [el("button", { class: "h3p-modal-delete", onclick: () => { close(); info.onDelete(); } }, "Delete this take")] : []),
   ]) : null;
   const overlay = el("div", { class: "h3p-modal", onclick: (e) => { if (e.target === overlay) close(); } },
     [video, infoPanel, el("button", { class: "h3p-modal-close", onclick: () => close() }, "✕")]);
@@ -339,6 +346,13 @@ class PromptEditor {
     const folder = el("input", { type: "text", placeholder: "project folder (under output/)", value: g.project_folder,
       title: "Where each clip's latent is saved/loaded (project_folder/clip_N.latent, under ComfyUI's output folder)." });
     folder.addEventListener("change", () => { g.project_folder = folder.value.trim(); this.changed(); });
+    const draftCheckbox = el("input", { type: "checkbox", checked: g.draft || undefined,
+      title: "When on, width/height output the resolution below instead of the base one, so every node " +
+             "wired to them runs this clip at draft resolution." });
+    draftCheckbox.addEventListener("change", () => { g.draft = draftCheckbox.checked; this.changed(); this.render(); });
+    const draftLabel = el("label", { style: "display:flex;align-items:center;gap:4px;cursor:pointer" }, [draftCheckbox, "Draft"]);
+    const draftBtn = el("button", { class: "h3p-chain", disabled: !this.clip,
+      title: this.clip ? "Queue the selected clip once" : "Choose a clip first", onclick: () => this.runDraft() }, "▶ Draft");
     const chainStart = this.state.clips.findIndex((clip) => !clip.activeGeneration);
     const chainBtn = el("button", {
       class: `h3p-chain${this.chainRunning ? " running" : ""}`,
@@ -353,6 +367,9 @@ class PromptEditor {
         aspectSelect, mp("megapixels", "Base megapixels"), el("span", { class: "h3p-hint" }, "MP"), readout(g.megapixels),
         ...(g.two_phase ? [el("span", { class: "sep" }, "→"),
           mp("upscale_megapixels", "Upscale megapixels"), el("span", { class: "h3p-hint" }, "MP"), readout(g.upscale_megapixels)] : []),
+        el("span", { class: "sep" }, "|"),
+        draftLabel, mp("draft_megapixels", "Draft megapixels"), el("span", { class: "h3p-hint" }, "MP"),
+        readout(g.draft_megapixels), draftBtn,
       ]),
       el("div", { class: "h3p-general" }, [folder, validation, chainBtn]),
     ]);
@@ -367,9 +384,17 @@ class PromptEditor {
       this.changed();
       this.render();
     });
+    let continuityFrom = null;
+    if (at > 0) {
+      const options = [["", `Clip ${at} (auto)`], ...this.state.clips.slice(0, at).map((c, i) => [c.id, `Clip ${i + 1}`])];
+      continuityFrom = el("select", { title: "Which earlier clip's selected take to continue from" },
+        options.map(([value, label]) => el("option", { value, selected: (clip.continuityFrom || "") === value }, label)));
+      continuityFrom.addEventListener("change", () => { clip.continuityFrom = continuityFrom.value || null; this.changed(); this.render(); });
+    }
     return el("div", { class: "h3p-clipbar" }, [
       el("span", { class: "name" }, `Clip ${at + 1}`),
       duration, el("span", { class: "h3p-hint" }, "s"),
+      ...(continuityFrom ? [el("span", { class: "h3p-hint" }, "continue from"), continuityFrom] : []),
       el("span", { style: "flex:1" }),
       el("button", { class: "h3p-icon", title: "Move left", disabled: at === 0, onclick: () => this.moveClip(-1) }, "◀"),
       el("button", { class: "h3p-icon", title: "Move right", disabled: at === count - 1, onclick: () => this.moveClip(1) }, "▶"),
@@ -391,7 +416,8 @@ class PromptEditor {
       if (g.videoPath) {
         const url = outputUrl(g.videoPath);
         const thumb = el("video", { src: url, class: "h3p-gen-thumb", muted: true, preload: "metadata", title: g.videoPath,
-          onclick: (e) => { e.stopPropagation(); openVideoModal(url, { take: g.take, videoPaths: g.videoPaths, latentPath }); } });
+          onclick: (e) => { e.stopPropagation(); openVideoModal(url, { take: g.take, videoPaths: g.videoPaths, latentPath,
+            onDelete: () => this.deleteTake(g) }); } });
         thumb.addEventListener("loadedmetadata", () => { thumb.currentTime = Math.min(0.1, thumb.duration || 0); });
         content.unshift(thumb);
       }
@@ -435,6 +461,28 @@ class PromptEditor {
       return;
     }
     clip.generations = [active];
+    this.changed();
+    this.render();
+  }
+
+  async deleteTake(generation) {
+    const clip = this.clip;
+    const response = await fetch("/h3remake/delete_take", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        project_folder: this.state.general.project_folder,
+        clip_index: this.clipIndex + 1,
+        take: generation.take,
+        delete_video_paths: generation.videoPaths || [],
+      }),
+    });
+    if (!response.ok) {
+      console.error("H3VideoRemake: delete_take failed", response.status, await response.text());
+      return;
+    }
+    clip.generations = clip.generations.filter((g) => g.id !== generation.id);
+    if (clip.activeGeneration === generation.id) clip.activeGeneration = null;
     this.changed();
     this.render();
   }
@@ -523,6 +571,11 @@ class PromptEditor {
     clip.generations.push({ id: uid(), take, videoPath: videoPaths[videoPaths.length - 1] || "", videoPaths });
     this.changed();
     this.render();
+  }
+
+  async runDraft() {
+    if (!this.clip) return;
+    await app.queuePrompt(0, 1);
   }
 
   // ---------- chain: run every not-yet-valid clip in order, unsupervised ----------
